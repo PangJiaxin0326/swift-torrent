@@ -31,19 +31,18 @@ public final class UDPTracker: Sendable {
 
     private func announce(params: AnnounceParams, endpoint: ResolvedDatagramEndpoint) async throws -> AnnounceResponse {
         let handler = UDPResponseHandler()
+        let remoteAddr = try SocketAddress(ipAddress: endpoint.address, port: port)
         let channel = try await DatagramBootstrap(group: group)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .channelInitializer { channel in
                 channel.pipeline.addHandler(handler)
             }
-            .bind(host: endpoint.bindHost, port: 0)
+            .connect(to: remoteAddr)
             .get()
 
         defer {
             channel.close(promise: nil)
         }
-
-        let remoteAddr = try SocketAddress(ipAddress: endpoint.address, port: port)
 
         // Step 1: Connect request
         let transactionID = UInt32.random(in: 0...UInt32.max)
@@ -54,8 +53,7 @@ public final class UDPTracker: Sendable {
 
         var buf = channel.allocator.buffer(capacity: connectReq.count)
         buf.writeBytes(connectReq)
-        let envelope = AddressedEnvelope(remoteAddress: remoteAddr, data: buf)
-        try await channel.writeAndFlush(envelope).get()
+        try await channel.writeAndFlush(buf).get()
 
         // Read connect response (16 bytes: action(4) + txid(4) + connection_id(8))
         let connectResponse = try await handler.waitForResponse(timeout: .seconds(5))
@@ -88,8 +86,7 @@ public final class UDPTracker: Sendable {
 
         var abuf = channel.allocator.buffer(capacity: announceReq.count)
         abuf.writeBytes(announceReq)
-        let aenvelope = AddressedEnvelope(remoteAddress: remoteAddr, data: abuf)
-        try await channel.writeAndFlush(aenvelope).get()
+        try await channel.writeAndFlush(abuf).get()
 
         // Read announce response (20+ bytes: action(4) + txid(4) + interval(4) + leechers(4) + seeders(4) + peers(6*N))
         let announceResponse = try await handler.waitForResponse(timeout: .seconds(5))
@@ -143,13 +140,12 @@ public final class UDPTracker: Sendable {
                         continue
                     }
 
-                    let bindHost = family == AF_INET6 ? "::" : "0.0.0.0"
                     let addr = addrInfo.pointee.ai_addr!
                     let addrLength = addrInfo.pointee.ai_addrlen
                     guard let address = Self.numericHost(from: addr, length: addrLength) else {
                         continue
                     }
-                    let endpoint = ResolvedDatagramEndpoint(address: address, bindHost: bindHost)
+                    let endpoint = ResolvedDatagramEndpoint(address: address)
                     if endpoints.contains(endpoint) == false {
                         endpoints.append(endpoint)
                     }
@@ -187,7 +183,6 @@ public final class UDPTracker: Sendable {
 
 private struct ResolvedDatagramEndpoint: Equatable, Sendable {
     let address: String
-    let bindHost: String
 }
 
 /// NIO channel handler that collects UDP responses.
