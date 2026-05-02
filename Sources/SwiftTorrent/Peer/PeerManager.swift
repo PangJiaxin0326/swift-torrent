@@ -11,6 +11,7 @@ public actor PeerManager {
     private var connectedPeers: Set<String> = []
     private var peerInfos: [String: PeerInfo] = [:]
     private var peerStates: [String: PeerState] = [:]
+    private var pendingMessages: [String: [PeerMessage]] = [:]
     private let maxConnections: Int
 
     public var pieceManager: PieceManager?
@@ -53,6 +54,7 @@ public actor PeerManager {
         let conn = PeerConnection(address: address, port: port, infoHash: infoHash, peerID: peerID)
         connections[key] = conn
         peerInfos[key] = PeerInfo(id: Data(), address: address, port: port)
+        peerStates[key] = PeerState(pieceCount: pieceCount > 0 ? pieceCount : 1)
 
         // Set up message callbacks
         conn.onMessage = { [weak self] message in
@@ -75,15 +77,9 @@ public actor PeerManager {
     }
 
     private func onPeerConnected(key: String, conn: PeerConnection) async {
-        connectedPeers.insert(key)
-
-        let pc = pieceCount > 0 ? pieceCount : 1
-        let state = PeerState(pieceCount: pc)
-        await state.setAmInterested(true)
-        if conn.supportsExtensions {
-            await state.setAmInterested(true)
-        }
+        let state = peerStates[key] ?? PeerState(pieceCount: pieceCount > 0 ? pieceCount : 1)
         peerStates[key] = state
+        await state.setAmInterested(true)
 
         // Send interested
         try? await conn.send(.interested)
@@ -92,6 +88,13 @@ public actor PeerManager {
         if conn.supportsExtensions, let metaEx = metadataExchange {
             let extHandshake = await metaEx.buildExtendedHandshake()
             try? await conn.send(.extended(id: 0, payload: extHandshake))
+        }
+
+        connectedPeers.insert(key)
+
+        let pending = pendingMessages.removeValue(forKey: key) ?? []
+        for message in pending {
+            await handleMessage(message, from: key)
         }
     }
 
@@ -108,10 +111,16 @@ public actor PeerManager {
         connections.removeValue(forKey: key)
         peerInfos.removeValue(forKey: key)
         peerStates.removeValue(forKey: key)
+        pendingMessages.removeValue(forKey: key)
         connectedPeers.remove(key)
     }
 
     private func handleMessage(_ message: PeerMessage, from key: String) async {
+        guard connectedPeers.contains(key) else {
+            pendingMessages[key, default: []].append(message)
+            return
+        }
+
         guard let state = peerStates[key] else { return }
 
         switch message {
@@ -253,6 +262,7 @@ public actor PeerManager {
         connections.removeValue(forKey: key)
         peerInfos.removeValue(forKey: key)
         peerStates.removeValue(forKey: key)
+        pendingMessages.removeValue(forKey: key)
         connectedPeers.remove(key)
     }
 
@@ -264,6 +274,7 @@ public actor PeerManager {
         }
         peerInfos.removeValue(forKey: key)
         peerStates.removeValue(forKey: key)
+        pendingMessages.removeValue(forKey: key)
         connectedPeers.remove(key)
     }
 

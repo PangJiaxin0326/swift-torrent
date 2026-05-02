@@ -49,7 +49,7 @@ public final class PeerConnection: @unchecked Sendable {
                 let decoderHandler = ByteToMessageHandler(PeerMessageDecoder(handshakeState: handshakeState))
                 let messageHandler = PeerMessageHandler(onMessage: onMsg, onDisconnect: onDisc)
                 do {
-                    try channel.pipeline.syncOperations.addHandlers(decoderHandler, messageHandler)
+                    try channel.pipeline.syncOperations.addHandlers(decoderHandler, messageHandler, PeerMessageEncoder())
                     return channel.eventLoop.makeSucceededFuture(())
                 } catch {
                     return channel.eventLoop.makeFailedFuture(error)
@@ -61,14 +61,14 @@ public final class PeerConnection: @unchecked Sendable {
 
         // Send handshake as raw bytes (before the encoder is in the pipeline)
         let handshake = Handshake(infoHash: infoHash, peerID: peerID)
-        var buffer = ch.allocator.buffer(capacity: Handshake.length)
-        buffer.writeBytes(handshake.encode())
-        try await ch.writeAndFlush(buffer).get()
+        try await ch.writeAndFlush(PeerOutbound.raw(handshake.encode())).get()
 
-        // Add the message encoder after handshake is sent
-        try await ch.pipeline.addHandler(PeerMessageEncoder()).get()
-
-        await handshakeState.waitForHandshake(timeout: .seconds(5))
+        do {
+            try await handshakeState.waitForHandshake(timeout: .seconds(5))
+        } catch {
+            try? await ch.close().get()
+            throw error
+        }
 
         // Store remote handshake info
         self.remotePeerID = handshakeState.remotePeerID
@@ -81,7 +81,7 @@ public final class PeerConnection: @unchecked Sendable {
         guard let ch = getChannel() else {
             throw PeerConnectionError.notConnected
         }
-        try await ch.writeAndFlush(message).get()
+        try await ch.writeAndFlush(PeerOutbound.message(message)).get()
     }
 
     public func close() async throws {
@@ -101,7 +101,7 @@ private final class PeerHandshakeState: @unchecked Sendable {
     private let lock = NSLock()
     private var _remotePeerID: Data?
     private var _supportsExtensions = false
-    private var handshakeContinuation: CheckedContinuation<Void, Never>?
+    private var handshakeContinuation: CheckedContinuation<Void, any Error>?
 
     var remotePeerID: Data? {
         lock.lock()
@@ -122,31 +122,28 @@ private final class PeerHandshakeState: @unchecked Sendable {
         let continuation = handshakeContinuation
         handshakeContinuation = nil
         lock.unlock()
-        continuation?.resume()
+        continuation?.resume(returning: ())
     }
 
-    func waitForHandshake(timeout: Duration) async {
+    func waitForHandshake(timeout: Duration) async throws {
         if remotePeerID != nil { return }
 
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { await self.waitForHandshake() }
-            group.addTask {
-                try? await Task.sleep(for: timeout)
-                guard !Task.isCancelled else { return }
-                self.resumeHandshakeWaiterIfNeeded()
-            }
-
-            await group.next()
-            group.cancelAll()
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
+            self?.resumeHandshakeWaiterIfNeeded(throwing: PeerConnectionError.handshakeFailed)
         }
+
+        defer { timeoutTask.cancel() }
+        try await waitForHandshake()
     }
 
-    private func waitForHandshake() async {
-        await withCheckedContinuation { continuation in
+    private func waitForHandshake() async throws {
+        try await withCheckedThrowingContinuation { continuation in
             lock.lock()
             if _remotePeerID != nil {
                 lock.unlock()
-                continuation.resume()
+                continuation.resume(returning: ())
                 return
             }
 
@@ -155,12 +152,12 @@ private final class PeerHandshakeState: @unchecked Sendable {
         }
     }
 
-    private func resumeHandshakeWaiterIfNeeded() {
+    private func resumeHandshakeWaiterIfNeeded(throwing error: any Error) {
         lock.lock()
         let continuation = handshakeContinuation
         handshakeContinuation = nil
         lock.unlock()
-        continuation?.resume()
+        continuation?.resume(throwing: error)
     }
 }
 
@@ -235,13 +232,24 @@ final class PeerMessageHandler: ChannelInboundHandler, Sendable {
 }
 
 /// Encodes peer wire protocol messages to byte stream.
-final class PeerMessageEncoder: ChannelOutboundHandler, Sendable {
-    typealias OutboundIn = PeerMessage
+fileprivate enum PeerOutbound: Sendable {
+    case raw(Data)
+    case message(PeerMessage)
+}
+
+fileprivate final class PeerMessageEncoder: ChannelOutboundHandler, Sendable {
+    typealias OutboundIn = PeerOutbound
     typealias OutboundOut = ByteBuffer
 
     func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
-        let msg = unwrapOutboundIn(data)
-        let encoded = msg.encode()
+        let outbound = unwrapOutboundIn(data)
+        let encoded: Data
+        switch outbound {
+        case .raw(let bytes):
+            encoded = bytes
+        case .message(let msg):
+            encoded = msg.encode()
+        }
         var buffer = context.channel.allocator.buffer(capacity: encoded.count)
         buffer.writeBytes(encoded)
         context.write(wrapOutboundOut(buffer), promise: promise)

@@ -355,6 +355,71 @@ final class HandshakeExtensionBitTests: XCTestCase {
         XCTAssertEqual(connection.remotePeerID, serverPeerID)
         XCTAssertTrue(connection.supportsExtensions)
     }
+
+    func testPeerManagerReplaysEarlyExtendedHandshakeAfterLocalHandshake() async throws {
+        let encoder = BencodeEncoder()
+        let infoDict = BencodeValue.dictionary([
+            (key: Data("length".utf8), value: .integer(1024)),
+            (key: Data("name".utf8), value: .string(Data("early-metadata.txt".utf8))),
+            (key: Data("piece length".utf8), value: .integer(512)),
+            (key: Data("pieces".utf8), value: .string(Data(repeating: 0, count: 40)))
+        ])
+        let metadata = encoder.encode(infoDict)
+        let infoHash = InfoHash.v1(from: metadata)
+        let clientPeerID = Data("-ST0001-client-peer!".utf8)
+        let serverPeerID = Data("-ST0001-server-peer!".utf8)
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        addTeardownBlock {
+            try await group.shutdownGracefully()
+        }
+
+        let server = try await ServerBootstrap(group: group)
+            .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .childChannelInitializer { channel in
+                channel.pipeline.addHandler(
+                    EagerMetadataPeerHandler(infoHash: infoHash.bytes, peerID: serverPeerID, metadata: metadata)
+                )
+            }
+            .bind(host: "127.0.0.1", port: 0)
+            .get()
+        addTeardownBlock {
+            try await server.close().get()
+        }
+
+        let manager = PeerManager(infoHash: infoHash.bytes, peerID: clientPeerID, group: group)
+        await manager.configureMagnet(metadataExchange: MetadataExchange(infoHash: infoHash))
+
+        let (stream, continuation) = AsyncStream<TorrentInfo>.makeStream()
+        await manager.setOnMetadataReceived { info in
+            continuation.yield(info)
+            continuation.finish()
+        }
+
+        let waiter = Task<TorrentInfo, Error> {
+            try await withThrowingTaskGroup(of: TorrentInfo.self) { group in
+                group.addTask {
+                    for await info in stream {
+                        return info
+                    }
+                    throw TestTimeoutError.timedOut
+                }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(2))
+                    throw TestTimeoutError.timedOut
+                }
+
+                let result = try await group.next()!
+                group.cancelAll()
+                return result
+            }
+        }
+
+        await manager.addPeer(address: "127.0.0.1", port: UInt16(server.localAddress!.port!))
+
+        let received = try await waiter.value
+        XCTAssertEqual(received.name, "early-metadata.txt")
+        XCTAssertEqual(received.infoHash, infoHash)
+    }
 }
 
 final class TorrentHandleGetFilesTests: XCTestCase {
@@ -416,6 +481,115 @@ private final class HandshakeReplyHandler: ChannelInboundHandler, @unchecked Sen
         response.writeBytes(handshake.encode())
         context.writeAndFlush(wrapOutboundOut(response), promise: nil)
     }
+}
+
+private final class EagerMetadataPeerHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    private let infoHash: Data
+    private let peerID: Data
+    private let metadata: Data
+    private let serverMetadataID: UInt8 = 2
+    private var clientMetadataID: UInt8?
+    private var pending = ByteBuffer()
+    private var didSendHandshake = false
+
+    init(infoHash: Data, peerID: Data, metadata: Data) {
+        self.infoHash = infoHash
+        self.peerID = peerID
+        self.metadata = metadata
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var buffer = unwrapInboundIn(data)
+        pending.writeBuffer(&buffer)
+
+        if !didSendHandshake, pending.readableBytes >= Handshake.length {
+            _ = pending.readBytes(length: Handshake.length)
+            didSendHandshake = true
+            sendHandshakeAndEarlyExtension(context: context)
+        }
+
+        processPeerMessages(context: context)
+    }
+
+    private func sendHandshakeAndEarlyExtension(context: ChannelHandlerContext) {
+        var response = Data()
+        response.append(Handshake(infoHash: infoHash, peerID: peerID).encode())
+        response.append(PeerMessage.extended(id: 0, payload: serverExtendedHandshake()).encode())
+        write(response, context: context)
+    }
+
+    private func serverExtendedHandshake() -> Data {
+        BencodeEncoder().encode(BencodeValue.dictionary([
+            (key: Data("m".utf8), value: BencodeValue.dictionary([
+                (key: Data("ut_metadata".utf8), value: .integer(Int64(serverMetadataID)))
+            ])),
+            (key: Data("metadata_size".utf8), value: .integer(Int64(metadata.count)))
+        ]))
+    }
+
+    private func processPeerMessages(context: ChannelHandlerContext) {
+        while pending.readableBytes >= 4 {
+            guard let lengthBytes = pending.getBytes(at: pending.readerIndex, length: 4) else {
+                return
+            }
+            let length = Int(Data(lengthBytes).readUInt32BE(at: 0))
+            guard pending.readableBytes >= 4 + length else {
+                return
+            }
+
+            pending.moveReaderIndex(forwardBy: 4)
+            guard let payload = pending.readBytes(length: length),
+                  let message = try? PeerMessage.decode(from: Data(payload)) else {
+                continue
+            }
+
+            handle(message, context: context)
+        }
+    }
+
+    private func handle(_ message: PeerMessage, context: ChannelHandlerContext) {
+        guard case .extended(let id, let payload) = message else {
+            return
+        }
+
+        if id == 0 {
+            if let value = try? BencodeDecoder().decode(payload),
+               let utMetadata = value["m"]?["ut_metadata"]?.integerValue {
+                clientMetadataID = UInt8(utMetadata)
+            }
+            return
+        }
+
+        guard id == serverMetadataID,
+              let clientMetadataID,
+              let value = try? BencodeDecoder().decode(payload),
+              value["msg_type"]?.integerValue == 0,
+              value["piece"]?.integerValue == 0 else {
+            return
+        }
+
+        let header = BencodeEncoder().encode(BencodeValue.dictionary([
+            (key: Data("msg_type".utf8), value: .integer(1)),
+            (key: Data("piece".utf8), value: .integer(0)),
+            (key: Data("total_size".utf8), value: .integer(Int64(metadata.count)))
+        ]))
+        var responsePayload = header
+        responsePayload.append(metadata)
+        write(PeerMessage.extended(id: clientMetadataID, payload: responsePayload).encode(), context: context)
+    }
+
+    private func write(_ data: Data, context: ChannelHandlerContext) {
+        var response = context.channel.allocator.buffer(capacity: data.count)
+        response.writeBytes(data)
+        context.writeAndFlush(wrapOutboundOut(response), promise: nil)
+    }
+}
+
+private enum TestTimeoutError: Error {
+    case timedOut
 }
 
 // MARK: - Helpers
