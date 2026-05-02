@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import Crypto
+import NIOCore
 import NIOPosix
 @testable import SwiftTorrent
 
@@ -317,6 +318,43 @@ final class HandshakeExtensionBitTests: XCTestCase {
         let hs = Handshake(infoHash: Data(repeating: 0, count: 20), peerID: Data(repeating: 0, count: 20), reserved: custom)
         XCTAssertEqual(hs.reserved[5] & 0x10, 0)
     }
+
+    func testPeerConnectionWaitsForRemoteExtensionSupport() async throws {
+        let infoHash = Data(repeating: 1, count: 20)
+        let clientPeerID = Data("-ST0001-client-peer!".utf8)
+        let serverPeerID = Data("-ST0001-server-peer!".utf8)
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        addTeardownBlock {
+            try await group.shutdownGracefully()
+        }
+
+        let server = try await ServerBootstrap(group: group)
+            .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .childChannelInitializer { channel in
+                channel.pipeline.addHandler(
+                    HandshakeReplyHandler(infoHash: infoHash, peerID: serverPeerID)
+                )
+            }
+            .bind(host: "127.0.0.1", port: 0)
+            .get()
+        addTeardownBlock {
+            try await server.close().get()
+        }
+
+        let connection = PeerConnection(
+            address: "127.0.0.1",
+            port: UInt16(server.localAddress!.port!),
+            infoHash: infoHash,
+            peerID: clientPeerID
+        )
+        let channel = try await connection.connect(on: group)
+        addTeardownBlock {
+            try await channel.close().get()
+        }
+
+        XCTAssertEqual(connection.remotePeerID, serverPeerID)
+        XCTAssertTrue(connection.supportsExtensions)
+    }
 }
 
 final class TorrentHandleGetFilesTests: XCTestCase {
@@ -348,6 +386,35 @@ final class TorrentHandleGetFilesTests: XCTestCase {
         XCTAssertNotNil(files)
         XCTAssertEqual(files?.count, 1)
         XCTAssertEqual(files?.first?.path, "test")
+    }
+}
+
+private final class HandshakeReplyHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+    typealias OutboundOut = ByteBuffer
+
+    private let infoHash: Data
+    private let peerID: Data
+    private var pending = ByteBuffer()
+    private var didReply = false
+
+    init(infoHash: Data, peerID: Data) {
+        self.infoHash = infoHash
+        self.peerID = peerID
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var buffer = unwrapInboundIn(data)
+        pending.writeBuffer(&buffer)
+
+        guard !didReply, pending.readableBytes >= Handshake.length else { return }
+        _ = pending.readBytes(length: Handshake.length)
+        didReply = true
+
+        let handshake = Handshake(infoHash: infoHash, peerID: peerID)
+        var response = context.channel.allocator.buffer(capacity: Handshake.length)
+        response.writeBytes(handshake.encode())
+        context.writeAndFlush(wrapOutboundOut(response), promise: nil)
     }
 }
 

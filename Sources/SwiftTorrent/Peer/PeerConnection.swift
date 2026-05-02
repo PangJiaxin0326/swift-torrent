@@ -68,6 +68,8 @@ public final class PeerConnection: @unchecked Sendable {
         // Add the message encoder after handshake is sent
         try await ch.pipeline.addHandler(PeerMessageEncoder()).get()
 
+        await handshakeState.waitForHandshake(timeout: .seconds(5))
+
         // Store remote handshake info
         self.remotePeerID = handshakeState.remotePeerID
         self.supportsExtensions = handshakeState.supportsExtensions
@@ -99,6 +101,7 @@ private final class PeerHandshakeState: @unchecked Sendable {
     private let lock = NSLock()
     private var _remotePeerID: Data?
     private var _supportsExtensions = false
+    private var handshakeContinuation: CheckedContinuation<Void, Never>?
 
     var remotePeerID: Data? {
         lock.lock()
@@ -116,7 +119,48 @@ private final class PeerHandshakeState: @unchecked Sendable {
         lock.lock()
         _remotePeerID = remotePeerID
         _supportsExtensions = supportsExtensions
+        let continuation = handshakeContinuation
+        handshakeContinuation = nil
         lock.unlock()
+        continuation?.resume()
+    }
+
+    func waitForHandshake(timeout: Duration) async {
+        if remotePeerID != nil { return }
+
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await self.waitForHandshake() }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                guard !Task.isCancelled else { return }
+                self.resumeHandshakeWaiterIfNeeded()
+            }
+
+            await group.next()
+            group.cancelAll()
+        }
+    }
+
+    private func waitForHandshake() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if _remotePeerID != nil {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+
+            handshakeContinuation = continuation
+            lock.unlock()
+        }
+    }
+
+    private func resumeHandshakeWaiterIfNeeded() {
+        lock.lock()
+        let continuation = handshakeContinuation
+        handshakeContinuation = nil
+        lock.unlock()
+        continuation?.resume()
     }
 }
 
