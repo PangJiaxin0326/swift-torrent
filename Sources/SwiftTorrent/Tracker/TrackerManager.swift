@@ -25,6 +25,8 @@ public actor TrackerManager {
 
     /// Announce to all tracker tiers, returning the first successful response.
     public func announce(params: AnnounceParams) async throws -> AnnounceResponse {
+        var firstSuccessfulResponse: AnnounceResponse?
+
         for tier in tiers {
             for urlString in tier {
                 do {
@@ -45,12 +47,22 @@ public actor TrackerManager {
                     }
                     lastResponse = response
                     announceInterval = response.interval
+                    if response.peers.isEmpty {
+                        firstSuccessfulResponse = firstSuccessfulResponse ?? response
+                        continue
+                    }
+
                     return response
                 } catch {
                     continue // Try next tracker in tier
                 }
             }
         }
+
+        if let firstSuccessfulResponse {
+            return firstSuccessfulResponse
+        }
+
         throw TrackerError.connectionFailed
     }
 
