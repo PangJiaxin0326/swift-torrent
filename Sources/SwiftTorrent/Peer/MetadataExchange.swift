@@ -14,7 +14,7 @@ public actor MetadataExchange {
 
     public static let metadataPieceSize = 16384
 
-    public enum Result {
+    public enum Result: Sendable {
         case none
         case sendMessage(PeerMessage)
         case requestMore([PeerMessage])

@@ -1,11 +1,11 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.3
 import PackageDescription
 
 let package = Package(
     name: "SwiftTorrent",
     platforms: [
-        .macOS(.v14),
-        .iOS(.v17)
+        .macOS("26.5"),
+        .iOS("26.5")
     ],
     products: [
         .library(name: "SwiftTorrent", targets: ["SwiftTorrent"])

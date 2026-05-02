@@ -180,8 +180,8 @@ public actor TorrentHandle {
                 guard let self, !Task.isCancelled else { break }
 
                 let left = await self.getRemainingBytes()
-                let infoHash = await self.infoHash
-                let peerID = await self.peerID
+                let infoHash = self.infoHash
+                let peerID = self.peerID
                 let uploaded = await self.totalUploaded
                 let downloaded = await self.totalDownloaded
                 let params = AnnounceParams(

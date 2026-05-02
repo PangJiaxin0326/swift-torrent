@@ -327,7 +327,9 @@ final class TorrentHandleGetFilesTests: XCTestCase {
             savePath: NSTemporaryDirectory()
         )
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        defer { try? group.syncShutdownGracefully() }
+        addTeardownBlock {
+            try await group.shutdownGracefully()
+        }
         let handle = TorrentHandle(params: params, settings: settings, group: group)
         let files = await handle.getFiles()
         XCTAssertNil(files)
@@ -338,7 +340,9 @@ final class TorrentHandleGetFilesTests: XCTestCase {
         let params = AddTorrentParams(torrentInfo: info, savePath: NSTemporaryDirectory())
         let settings = SessionSettings(listenPort: 0, savePath: NSTemporaryDirectory())
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        defer { try? group.syncShutdownGracefully() }
+        addTeardownBlock {
+            try await group.shutdownGracefully()
+        }
         let handle = TorrentHandle(params: params, settings: settings, group: group)
         let files = await handle.getFiles()
         XCTAssertNotNil(files)

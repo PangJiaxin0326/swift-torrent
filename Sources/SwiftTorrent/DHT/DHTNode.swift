@@ -334,7 +334,8 @@ public actor DHTNode {
                 let addr = addrInfo.pointee.ai_addr!
                 var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                 getnameinfo(addr, addrInfo.pointee.ai_addrlen, &hostBuf, socklen_t(NI_MAXHOST), nil, 0, NI_NUMERICHOST)
-                continuation.resume(returning: String(cString: hostBuf))
+                let hostBytes = hostBuf.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+                continuation.resume(returning: String(decoding: hostBytes, as: UTF8.self))
             }
         }
     }

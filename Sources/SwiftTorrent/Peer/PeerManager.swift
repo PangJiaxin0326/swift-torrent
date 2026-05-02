@@ -69,7 +69,7 @@ public actor PeerManager {
                 let _ = try await conn.connect(on: group)
                 await self.onPeerConnected(key: key, conn: conn)
             } catch {
-                await self.removePeerByKey(key)
+                self.removePeerByKey(key)
             }
         }
     }

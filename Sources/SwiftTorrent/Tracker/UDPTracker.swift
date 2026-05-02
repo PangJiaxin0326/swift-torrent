@@ -130,7 +130,8 @@ public final class UDPTracker: Sendable {
                 let addr = addrInfo.pointee.ai_addr!
                 var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                 getnameinfo(addr, addrInfo.pointee.ai_addrlen, &hostBuf, socklen_t(NI_MAXHOST), nil, 0, NI_NUMERICHOST)
-                continuation.resume(returning: String(cString: hostBuf))
+                let hostBytes = hostBuf.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+                continuation.resume(returning: String(decoding: hostBytes, as: UTF8.self))
             }
         }
     }
@@ -151,52 +152,64 @@ private final class UDPResponseHandler: ChannelInboundHandler, @unchecked Sendab
         guard let bytes = buffer.readBytes(length: buffer.readableBytes) else { return }
         let responseData = Data(bytes)
 
-        lock.lock()
-        if let firstKey = continuations.keys.sorted().first {
-            let cont = continuations.removeValue(forKey: firstKey)!
-            lock.unlock()
-            cont.resume(returning: responseData)
-        } else {
-            receivedData.append(responseData)
-            lock.unlock()
+        if let continuation = storeResponseOrTakeContinuation(responseData) {
+            continuation.resume(returning: responseData)
         }
     }
 
     func waitForResponse(timeout: TimeAmount) async throws -> Data {
-        // Check if we already have data
-        lock.lock()
-        if !receivedData.isEmpty {
-            let data = receivedData.removeFirst()
-            lock.unlock()
-            return data
-        }
-        lock.unlock()
-
-        return try await withCheckedThrowingContinuation { continuation in
-            lock.lock()
-            if !receivedData.isEmpty {
-                let data = receivedData.removeFirst()
-                lock.unlock()
+        try await withCheckedThrowingContinuation { continuation in
+            switch registerWaiter(continuation) {
+            case .resumeImmediately(let data):
                 continuation.resume(returning: data)
-            } else {
-                let id = nextID
-                nextID += 1
-                continuations[id] = continuation
-                lock.unlock()
-
-                // Timeout
+            case .wait(let id):
                 Task {
-                    try? await Task.sleep(for: .seconds(5))
-                    self.lock.lock()
-                    if let cont = self.continuations.removeValue(forKey: id) {
-                        self.lock.unlock()
-                        cont.resume(throwing: TrackerError.connectionFailed)
-                    } else {
-                        self.lock.unlock()
+                    try? await Task.sleep(for: Duration(timeout))
+                    if let continuation = self.removeContinuation(id: id) {
+                        continuation.resume(throwing: TrackerError.connectionFailed)
                     }
                 }
             }
         }
+    }
+
+    private enum WaitRegistration {
+        case resumeImmediately(Data)
+        case wait(UInt64)
+    }
+
+    private func storeResponseOrTakeContinuation(_ responseData: Data) -> CheckedContinuation<Data, Error>? {
+        lock.lock()
+        if let firstKey = continuations.keys.sorted().first {
+            let cont = continuations.removeValue(forKey: firstKey)!
+            lock.unlock()
+            return cont
+        } else {
+            receivedData.append(responseData)
+            lock.unlock()
+            return nil
+        }
+    }
+
+    private func registerWaiter(_ continuation: CheckedContinuation<Data, Error>) -> WaitRegistration {
+        lock.lock()
+        if !receivedData.isEmpty {
+            let data = receivedData.removeFirst()
+            lock.unlock()
+            return .resumeImmediately(data)
+        }
+
+        let id = nextID
+        nextID += 1
+        continuations[id] = continuation
+        lock.unlock()
+        return .wait(id)
+    }
+
+    private func removeContinuation(id: UInt64) -> CheckedContinuation<Data, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return continuations.removeValue(forKey: id)
     }
 }
 

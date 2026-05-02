@@ -40,15 +40,20 @@ public final class PeerConnection: @unchecked Sendable {
     public func connect(on group: EventLoopGroup) async throws -> Channel {
         let onMsg = self.onMessage
         let onDisc = self.onDisconnect
-        let decoder = PeerMessageDecoder()
+        let handshakeState = PeerHandshakeState()
 
         let bootstrap = ClientBootstrap(group: group)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .connectTimeout(.seconds(10))
             .channelInitializer { channel in
-                let decoderHandler = ByteToMessageHandler(decoder)
+                let decoderHandler = ByteToMessageHandler(PeerMessageDecoder(handshakeState: handshakeState))
                 let messageHandler = PeerMessageHandler(onMessage: onMsg, onDisconnect: onDisc)
-                return channel.pipeline.addHandlers([decoderHandler, messageHandler])
+                do {
+                    try channel.pipeline.syncOperations.addHandlers(decoderHandler, messageHandler)
+                    return channel.eventLoop.makeSucceededFuture(())
+                } catch {
+                    return channel.eventLoop.makeFailedFuture(error)
+                }
             }
         let ch = try await bootstrap.connect(host: address, port: Int(port)).get()
 
@@ -64,8 +69,8 @@ public final class PeerConnection: @unchecked Sendable {
         try await ch.pipeline.addHandler(PeerMessageEncoder()).get()
 
         // Store remote handshake info
-        self.remotePeerID = decoder.remotePeerID
-        self.supportsExtensions = decoder.remoteSupportsExtensions
+        self.remotePeerID = handshakeState.remotePeerID
+        self.supportsExtensions = handshakeState.supportsExtensions
 
         return ch
     }
@@ -90,21 +95,52 @@ public enum PeerConnectionError: Error {
 
 // MARK: - NIO Channel Handlers
 
+private final class PeerHandshakeState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _remotePeerID: Data?
+    private var _supportsExtensions = false
+
+    var remotePeerID: Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _remotePeerID
+    }
+
+    var supportsExtensions: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _supportsExtensions
+    }
+
+    func update(remotePeerID: Data, supportsExtensions: Bool) {
+        lock.lock()
+        _remotePeerID = remotePeerID
+        _supportsExtensions = supportsExtensions
+        lock.unlock()
+    }
+}
+
 /// Decodes peer wire protocol messages from byte stream.
 final class PeerMessageDecoder: ByteToMessageDecoder {
     typealias InboundOut = PeerMessage
 
     private var handshakeReceived = false
-    var remotePeerID: Data?
-    var remoteSupportsExtensions: Bool = false
+
+    private let handshakeState: PeerHandshakeState
+
+    fileprivate init(handshakeState: PeerHandshakeState) {
+        self.handshakeState = handshakeState
+    }
 
     func decode(context: ChannelHandlerContext, buffer: inout ByteBuffer) throws -> DecodingState {
         if !handshakeReceived {
             guard buffer.readableBytes >= Handshake.length else { return .needMoreData }
             guard let bytes = buffer.readBytes(length: Handshake.length) else { return .needMoreData }
             let handshake = try Handshake.decode(from: Data(bytes))
-            remotePeerID = handshake.peerID
-            remoteSupportsExtensions = (handshake.reserved[5] & 0x10) != 0
+            handshakeState.update(
+                remotePeerID: handshake.peerID,
+                supportsExtensions: (handshake.reserved[5] & 0x10) != 0
+            )
             handshakeReceived = true
             return .continue
         }
@@ -129,7 +165,7 @@ final class PeerMessageDecoder: ByteToMessageDecoder {
 }
 
 /// Receives decoded PeerMessage and calls the callback.
-final class PeerMessageHandler: ChannelInboundHandler {
+final class PeerMessageHandler: ChannelInboundHandler, Sendable {
     typealias InboundIn = PeerMessage
 
     private let onMessage: (@Sendable (PeerMessage) -> Void)?
@@ -155,7 +191,7 @@ final class PeerMessageHandler: ChannelInboundHandler {
 }
 
 /// Encodes peer wire protocol messages to byte stream.
-final class PeerMessageEncoder: ChannelOutboundHandler {
+final class PeerMessageEncoder: ChannelOutboundHandler, Sendable {
     typealias OutboundIn = PeerMessage
     typealias OutboundOut = ByteBuffer
 
