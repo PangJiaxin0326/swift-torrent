@@ -16,29 +16,34 @@ public final class UDPTracker: Sendable {
 
     /// Announce to the UDP tracker.
     public func announce(params: AnnounceParams) async throws -> AnnounceResponse {
-        // Resolve hostname to IP address first
-        let resolvedHost: String
-        if host.first?.isLetter == true {
-            // It's a hostname, resolve it
-            resolvedHost = try await resolveHostname(host)
-        } else {
-            resolvedHost = host
+        let endpoints = try await resolveEndpoints(host)
+        var lastError: (any Error)?
+        for endpoint in endpoints {
+            do {
+                return try await announce(params: params, endpoint: endpoint)
+            } catch {
+                lastError = error
+            }
         }
 
+        throw lastError ?? TrackerError.connectionFailed
+    }
+
+    private func announce(params: AnnounceParams, endpoint: ResolvedDatagramEndpoint) async throws -> AnnounceResponse {
         let handler = UDPResponseHandler()
         let channel = try await DatagramBootstrap(group: group)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .channelInitializer { channel in
                 channel.pipeline.addHandler(handler)
             }
-            .bind(host: "0.0.0.0", port: 0)
+            .bind(host: endpoint.bindHost, port: 0)
             .get()
 
         defer {
             channel.close(promise: nil)
         }
 
-        let remoteAddr = try SocketAddress(ipAddress: resolvedHost, port: port)
+        let remoteAddr = try SocketAddress(ipAddress: endpoint.address, port: port)
 
         // Step 1: Connect request
         let transactionID = UInt32.random(in: 0...UInt32.max)
@@ -114,27 +119,75 @@ public final class UDPTracker: Sendable {
         return AnnounceResponse(interval: interval, seeders: seeders, leechers: leechers, peers: peers)
     }
 
-    private func resolveHostname(_ hostname: String) async throws -> String {
+    private func resolveEndpoints(_ hostname: String) async throws -> [ResolvedDatagramEndpoint] {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global().async {
                 var hints = addrinfo()
-                hints.ai_family = AF_INET
+                hints.ai_family = AF_UNSPEC
                 hints.ai_socktype = Int32(SOCK_DGRAM)
+                hints.ai_protocol = IPPROTO_UDP
                 var result: UnsafeMutablePointer<addrinfo>?
                 let status = getaddrinfo(hostname, nil, &hints, &result)
-                guard status == 0, let addrInfo = result else {
+                guard status == 0, let result else {
                     continuation.resume(throwing: TrackerError.connectionFailed)
                     return
                 }
                 defer { freeaddrinfo(result) }
-                let addr = addrInfo.pointee.ai_addr!
-                var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                getnameinfo(addr, addrInfo.pointee.ai_addrlen, &hostBuf, socklen_t(NI_MAXHOST), nil, 0, NI_NUMERICHOST)
-                let hostBytes = hostBuf.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
-                continuation.resume(returning: String(decoding: hostBytes, as: UTF8.self))
+
+                var endpoints: [ResolvedDatagramEndpoint] = []
+                var cursor: UnsafeMutablePointer<addrinfo>? = result
+                while let addrInfo = cursor {
+                    defer { cursor = addrInfo.pointee.ai_next }
+                    let family = addrInfo.pointee.ai_family
+                    guard family == AF_INET || family == AF_INET6 else {
+                        continue
+                    }
+
+                    let bindHost = family == AF_INET6 ? "::" : "0.0.0.0"
+                    let addr = addrInfo.pointee.ai_addr!
+                    let addrLength = addrInfo.pointee.ai_addrlen
+                    guard let address = Self.numericHost(from: addr, length: addrLength) else {
+                        continue
+                    }
+                    let endpoint = ResolvedDatagramEndpoint(address: address, bindHost: bindHost)
+                    if endpoints.contains(endpoint) == false {
+                        endpoints.append(endpoint)
+                    }
+                }
+
+                guard endpoints.isEmpty == false else {
+                    continuation.resume(throwing: TrackerError.connectionFailed)
+                    return
+                }
+
+                continuation.resume(returning: endpoints)
             }
         }
     }
+
+    private static func numericHost(from address: UnsafePointer<sockaddr>, length: socklen_t) -> String? {
+        var hostBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let status = getnameinfo(
+            address,
+            length,
+            &hostBuffer,
+            socklen_t(hostBuffer.count),
+            nil,
+            0,
+            NI_NUMERICHOST
+        )
+        guard status == 0 else {
+            return nil
+        }
+
+        let hostBytes = hostBuffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: hostBytes, as: UTF8.self)
+    }
+}
+
+private struct ResolvedDatagramEndpoint: Equatable, Sendable {
+    let address: String
+    let bindHost: String
 }
 
 /// NIO channel handler that collects UDP responses.
