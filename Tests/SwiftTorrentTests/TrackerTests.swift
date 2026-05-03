@@ -124,6 +124,57 @@ final class TrackerTests: XCTestCase {
         XCTAssertEqual(response.peers.first?.0, "127.0.0.1")
         XCTAssertEqual(response.peers.first?.1, 51413)
     }
+
+    func testTrackerManagerAggregatesPeersFromAllSuccessfulTrackers() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        addTeardownBlock {
+            try await group.shutdownGracefully()
+        }
+
+        let firstServer = try await DatagramBootstrap(group: group)
+            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(LoopbackUDPTrackerHandler(peers: [("127.0.0.1", 51413)]))
+            }
+            .bind(host: "127.0.0.1", port: 0)
+            .get()
+        addTeardownBlock {
+            try await firstServer.close().get()
+        }
+
+        let secondServer = try await DatagramBootstrap(group: group)
+            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(LoopbackUDPTrackerHandler(peers: [
+                    ("127.0.0.1", 51413),
+                    ("127.0.0.2", 51414),
+                ]))
+            }
+            .bind(host: "127.0.0.1", port: 0)
+            .get()
+        addTeardownBlock {
+            try await secondServer.close().get()
+        }
+
+        let trackerManager = TrackerManager(
+            tiers: [
+                ["udp://127.0.0.1:\(firstServer.localAddress!.port!)/announce"],
+                ["udp://127.0.0.1:\(secondServer.localAddress!.port!)/announce"],
+            ],
+            group: group
+        )
+        let response = try await trackerManager.announce(params: AnnounceParams(
+            infoHash: InfoHash(bytes: Data(repeating: 0xaa, count: 20)),
+            peerID: Data("-ST0001-test-peer!!!".utf8),
+            port: 49_889,
+            left: 0,
+            event: "started"
+        ))
+
+        XCTAssertEqual(response.peers.count, 2)
+        XCTAssertTrue(response.peers.contains { $0.0 == "127.0.0.1" && $0.1 == 51413 })
+        XCTAssertTrue(response.peers.contains { $0.0 == "127.0.0.2" && $0.1 == 51414 })
+    }
 }
 
 private final class LoopbackUDPTrackerHandler: ChannelInboundHandler, @unchecked Sendable {

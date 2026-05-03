@@ -59,7 +59,7 @@ public actor DHTNode {
             // Resolve hostname
             if let ip = try? await resolveHostname(host) {
                 do {
-                    try await findNode(target: nodeID, to: ip, port: UInt16(port))
+                    _ = try await findNodeAndWait(target: nodeID, to: ip, port: UInt16(port))
                 } catch {
                     continue
                 }
@@ -170,18 +170,30 @@ public actor DHTNode {
         guard case .query(let txID, _, _) = msg else {
             throw DHTMessageError.invalidMessage
         }
-        try await sendMessage(msg, to: address, port: port)
 
         return try await withCheckedThrowingContinuation { continuation in
             self.pendingQueries[txID] = continuation
 
             Task {
+                do {
+                    try await self.sendMessage(msg, to: address, port: port)
+                } catch {
+                    if let cont = self.removePendingQuery(transactionID: txID) {
+                        cont.resume(throwing: error)
+                    }
+                    return
+                }
+
                 try? await Task.sleep(for: timeout)
-                if let cont = self.pendingQueries.removeValue(forKey: txID) {
+                if let cont = self.removePendingQuery(transactionID: txID) {
                     cont.resume(throwing: DHTMessageError.invalidMessage)
                 }
             }
         }
+    }
+
+    private func removePendingQuery(transactionID: Data) -> CheckedContinuation<DHTMessage, Error>? {
+        pendingQueries.removeValue(forKey: transactionID)
     }
 
     /// Send a ping query.
@@ -209,6 +221,20 @@ public actor DHTNode {
             ]
         )
         try await sendMessage(msg, to: address, port: port)
+    }
+
+    /// Send a find_node query and wait for its response.
+    public func findNodeAndWait(target: NodeID, to address: String, port: UInt16) async throws -> DHTMessage {
+        let txID = generateTransactionID()
+        let msg = DHTMessage.query(
+            transactionID: txID,
+            queryType: .findNode,
+            arguments: [
+                (key: Data("id".utf8), value: .string(nodeID.bytes)),
+                (key: Data("target".utf8), value: .string(target.bytes)),
+            ]
+        )
+        return try await sendAndWait(msg, to: address, port: port)
     }
 
     /// Send a get_peers query.

@@ -62,11 +62,12 @@ public enum HandshakeError: Error, Equatable {
     case invalidProtocol
 }
 
-/// Generate a random peer ID in Azureus style: -ST0001-<random 12 bytes>
+/// Generate a random printable peer ID in Azureus style: -ST0001-<random 12 chars>
 public func generatePeerID() -> Data {
     var id = Data("-ST0001-".utf8)
+    let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".utf8)
     for _ in 0..<12 {
-        id.append(UInt8.random(in: 0...255))
+        id.append(alphabet.randomElement()!)
     }
     return id
 }

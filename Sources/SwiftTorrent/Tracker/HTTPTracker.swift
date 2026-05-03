@@ -11,19 +11,28 @@ public struct HTTPTracker: Sendable {
     /// Announce to the tracker.
     public func announce(params: AnnounceParams) async throws -> AnnounceResponse {
         var components = URLComponents(string: announceURL)
-        components?.queryItems = [
-            URLQueryItem(name: "info_hash", value: params.infoHash.urlEncoded),
-            URLQueryItem(name: "peer_id", value: String(data: params.peerID, encoding: .ascii) ?? ""),
-            URLQueryItem(name: "port", value: String(params.port)),
-            URLQueryItem(name: "uploaded", value: String(params.uploaded)),
-            URLQueryItem(name: "downloaded", value: String(params.downloaded)),
-            URLQueryItem(name: "left", value: String(params.left)),
-            URLQueryItem(name: "compact", value: "1"),
-            URLQueryItem(name: "numwant", value: String(params.numWant)),
+        guard components != nil else {
+            throw TrackerError.invalidURL
+        }
+
+        var queryItems = [
+            "info_hash=\(Self.percentEncoded(params.infoHash.bytes))",
+            "peer_id=\(Self.percentEncoded(params.peerID))",
+            "port=\(params.port)",
+            "uploaded=\(params.uploaded)",
+            "downloaded=\(params.downloaded)",
+            "left=\(params.left)",
+            "compact=1",
+            "numwant=\(params.numWant)",
         ]
         if let event = params.event {
-            components?.queryItems?.append(URLQueryItem(name: "event", value: event))
+            queryItems.append("event=\(Self.percentEncoded(Data(event.utf8)))")
         }
+
+        if let existingQuery = components?.percentEncodedQuery, existingQuery.isEmpty == false {
+            queryItems.insert(existingQuery, at: 0)
+        }
+        components?.percentEncodedQuery = queryItems.joined(separator: "&")
 
         guard let url = components?.url else {
             throw TrackerError.invalidURL
@@ -31,6 +40,23 @@ public struct HTTPTracker: Sendable {
 
         let (data, _) = try await URLSession.shared.data(from: url)
         return try parseAnnounceResponse(data)
+    }
+
+    private static func percentEncoded(_ data: Data) -> String {
+        data.map { byte in
+            switch byte {
+            case UInt8(ascii: "A")...UInt8(ascii: "Z"),
+                 UInt8(ascii: "a")...UInt8(ascii: "z"),
+                 UInt8(ascii: "0")...UInt8(ascii: "9"),
+                 UInt8(ascii: "."),
+                 UInt8(ascii: "-"),
+                 UInt8(ascii: "_"),
+                 UInt8(ascii: "~"):
+                String(UnicodeScalar(byte))
+            default:
+                String(format: "%%%02X", byte)
+            }
+        }.joined()
     }
 
     private func parseAnnounceResponse(_ data: Data) throws -> AnnounceResponse {

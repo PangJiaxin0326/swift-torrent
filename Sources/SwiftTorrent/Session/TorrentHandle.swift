@@ -14,6 +14,7 @@ public actor TorrentHandle {
     private let magnetLink: MagnetLink?
     private let savePath: String
     private let peerID: Data
+    private let listenPort: UInt16
     private let group: EventLoopGroup
 
     private var peerManager: PeerManager
@@ -42,6 +43,7 @@ public actor TorrentHandle {
         self.magnetLink = params.magnetLink
         self.savePath = params.savePath ?? settings.savePath
         self.peerID = generatePeerID()
+        self.listenPort = settings.listenPort
         self.group = group
         self.peerManager = PeerManager(
             infoHash: hash.bytes, peerID: peerID, group: group,
@@ -108,7 +110,7 @@ public actor TorrentHandle {
         if let trackerMgr = trackerManager {
             let left = info?.totalSize ?? 0
             let params = AnnounceParams(
-                infoHash: infoHash, peerID: peerID, port: 6881,
+                infoHash: infoHash, peerID: peerID, port: listenPort,
                 left: left - totalDownloaded, event: "started"
             )
             await announceToAllTrackers(trackerMgr: trackerMgr, params: params)
@@ -171,6 +173,17 @@ public actor TorrentHandle {
         }
     }
 
+    public func addDiscoveredPeers(_ peers: [(String, UInt16)]) async {
+        guard state != .paused && state != .stopped else { return }
+        for (address, port) in peers {
+            await peerManager.addPeer(address: address, port: port)
+        }
+    }
+
+    public var isRunning: Bool {
+        state != .paused && state != .stopped
+    }
+
     /// Periodically re-announce to trackers.
     private func startReannounceLoop(trackerMgr: TrackerManager) {
         reannounceTask = Task { [weak self] in
@@ -185,7 +198,7 @@ public actor TorrentHandle {
                 let uploaded = await self.totalUploaded
                 let downloaded = await self.totalDownloaded
                 let params = AnnounceParams(
-                    infoHash: infoHash, peerID: peerID, port: 6881,
+                    infoHash: infoHash, peerID: peerID, port: self.listenPort,
                     uploaded: uploaded, downloaded: downloaded,
                     left: left
                 )

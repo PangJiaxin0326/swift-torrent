@@ -8,6 +8,7 @@ public actor Session {
     private var torrents: [InfoHash: TorrentHandle] = [:]
     private let group: MultiThreadedEventLoopGroup
     private var dhtNode: DHTNode?
+    private var dhtPeerDiscoveryTask: Task<Void, Never>?
     private let alertContinuation: AsyncStream<any Alert>.Continuation
     public let alerts: AsyncStream<any Alert>
 
@@ -40,6 +41,9 @@ public actor Session {
 
         if !params.paused {
             try await handle.start()
+        }
+        if let dhtNode, params.paused == false {
+            await discoverPeers(for: handle, using: dhtNode)
         }
 
         return handle
@@ -87,9 +91,15 @@ public actor Session {
     /// Start DHT if enabled.
     public func startDHT() async throws {
         guard settings.dhtEnabled else { return }
+        if dhtNode != nil {
+            startDHTPeerDiscoveryLoop()
+            return
+        }
         let node = DHTNode(port: settings.dhtPort, group: group)
         try await node.start()
         self.dhtNode = node
+        await discoverDHTPeersOnce()
+        startDHTPeerDiscoveryLoop()
     }
 
     /// Pause all torrents.
@@ -108,8 +118,36 @@ public actor Session {
 
     /// Shutdown the session.
     public func shutdown() async throws {
+        dhtPeerDiscoveryTask?.cancel()
         await pauseAll()
         alertContinuation.finish()
         try await group.shutdownGracefully()
+    }
+
+    private func startDHTPeerDiscoveryLoop() {
+        guard dhtPeerDiscoveryTask == nil else { return }
+        dhtPeerDiscoveryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.discoverDHTPeersOnce()
+                try? await Task.sleep(for: .seconds(60))
+            }
+        }
+    }
+
+    private func discoverDHTPeersOnce() async {
+        guard let dhtNode else { return }
+        for handle in torrents.values {
+            guard await handle.isRunning else { continue }
+            await discoverPeers(for: handle, using: dhtNode)
+        }
+    }
+
+    private func discoverPeers(for handle: TorrentHandle, using dhtNode: DHTNode) async {
+        let traversal = DHTTraversal(dhtNode: dhtNode)
+        guard let peers = try? await traversal.getPeers(infoHash: handle.infoHash),
+              peers.isEmpty == false else {
+            return
+        }
+        await handle.addDiscoveredPeers(peers)
     }
 }

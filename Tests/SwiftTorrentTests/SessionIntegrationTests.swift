@@ -28,6 +28,12 @@ final class SessionIntegrationTests: XCTestCase {
         let id = generatePeerID()
         XCTAssertEqual(id.count, 20)
         XCTAssertTrue(id.starts(with: Data("-ST0001-".utf8)))
+        XCTAssertTrue(id.allSatisfy { byte in
+            (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte)
+                || (UInt8(ascii: "A")...UInt8(ascii: "Z")).contains(byte)
+                || (UInt8(ascii: "a")...UInt8(ascii: "z")).contains(byte)
+                || byte == UInt8(ascii: "-")
+        })
     }
 
     func testResumeDataRoundTrip() throws {

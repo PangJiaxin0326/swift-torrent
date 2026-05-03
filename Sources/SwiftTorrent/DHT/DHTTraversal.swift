@@ -25,7 +25,7 @@ public actor DHTTraversal {
             for node in toQuery {
                 queried.insert(node.id)
                 do {
-                    try await dhtNode.findNode(target: target, to: node.address, port: node.port)
+                    _ = try await dhtNode.findNodeAndWait(target: target, to: node.address, port: node.port)
                 } catch {
                     continue
                 }
