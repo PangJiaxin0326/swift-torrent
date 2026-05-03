@@ -12,6 +12,7 @@ public actor PeerManager {
     private var peerInfos: [String: PeerInfo] = [:]
     private var peerStates: [String: PeerState] = [:]
     private var pendingMessages: [String: [PeerMessage]] = [:]
+    private var pendingAvailability: [String: PeerAvailabilityHint] = [:]
     private let maxConnections: Int
 
     public var pieceManager: PieceManager?
@@ -30,11 +31,20 @@ public actor PeerManager {
         self.maxConnections = maxConnections
     }
 
-    public func configure(pieceManager: PieceManager, piecePicker: PiecePicker, diskIO: DiskIO, pieceCount: Int) {
+    public func configure(pieceManager: PieceManager, piecePicker: PiecePicker, diskIO: DiskIO, pieceCount: Int) async {
         self.pieceManager = pieceManager
         self.piecePicker = piecePicker
         self.diskIO = diskIO
         self.pieceCount = pieceCount
+
+        for (key, state) in peerStates {
+            let bitfield = pendingAvailability[key]?.bitfield(pieceCount: pieceCount) ?? Bitfield(count: pieceCount)
+            await setPeerBitfield(bitfield, for: key, state: state)
+        }
+
+        for key in connectedPeers {
+            await fillRequests(for: key)
+        }
     }
 
     public func configureMagnet(metadataExchange: MetadataExchange) {
@@ -112,6 +122,7 @@ public actor PeerManager {
         peerInfos.removeValue(forKey: key)
         peerStates.removeValue(forKey: key)
         pendingMessages.removeValue(forKey: key)
+        pendingAvailability.removeValue(forKey: key)
         connectedPeers.remove(key)
     }
 
@@ -126,18 +137,20 @@ public actor PeerManager {
         switch message {
         case .bitfield(let data):
             let bf = Bitfield(data: data, count: pieceCount > 0 ? pieceCount : data.count * 8)
-            await state.setPeerBitfield(bf)
-            if var picker = piecePicker {
-                picker.addPeerBitfield(bf)
-                piecePicker = picker
+            if pieceCount == 0 {
+                pendingAvailability[key, default: PeerAvailabilityHint()].recordBitfield(data)
             }
-            peerInfos[key]?.peerBitfield = bf
+            await setPeerBitfield(bf, for: key, state: state)
             await fillRequests(for: key)
 
         case .have(let pieceIndex):
             let idx = Int(pieceIndex)
+            if pieceCount == 0 {
+                pendingAvailability[key, default: PeerAvailabilityHint()].recordHave(idx)
+            }
+            let hadPiece = await state.getPeerBitfield().get(idx)
             await state.setHave(idx)
-            if var picker = piecePicker {
+            if !hadPiece, var picker = piecePicker {
                 picker.addHave(idx)
                 piecePicker = picker
             }
@@ -156,6 +169,22 @@ public actor PeerManager {
 
         case .notInterested:
             await state.setPeerInterested(false)
+
+        case .haveAll:
+            pendingAvailability[key, default: PeerAvailabilityHint()].recordHaveAll()
+            if pieceCount > 0 {
+                var bf = Bitfield(count: pieceCount)
+                for index in 0..<pieceCount {
+                    bf.set(index)
+                }
+                await setPeerBitfield(bf, for: key, state: state)
+                await fillRequests(for: key)
+            }
+
+        case .haveNone:
+            pendingAvailability[key, default: PeerAvailabilityHint()].recordHaveNone()
+            let bf = Bitfield(count: pieceCount > 0 ? pieceCount : 1)
+            await setPeerBitfield(bf, for: key, state: state)
 
         case .piece(let index, let begin, let block):
             let pieceIndex = Int(index)
@@ -191,6 +220,18 @@ public actor PeerManager {
                     break
                 }
             }
+
+        case .rejectRequest(let index, let begin, let length):
+            let request = PeerState.BlockRequest(
+                pieceIndex: Int(index),
+                offset: Int(begin),
+                length: Int(length)
+            )
+            await state.removePendingRequest(request)
+            await fillRequests(for: key)
+
+        case .suggestPiece, .allowedFast, .unknown:
+            break
 
         default:
             break
@@ -263,6 +304,7 @@ public actor PeerManager {
         peerInfos.removeValue(forKey: key)
         peerStates.removeValue(forKey: key)
         pendingMessages.removeValue(forKey: key)
+        pendingAvailability.removeValue(forKey: key)
         connectedPeers.remove(key)
     }
 
@@ -275,6 +317,7 @@ public actor PeerManager {
         peerInfos.removeValue(forKey: key)
         peerStates.removeValue(forKey: key)
         pendingMessages.removeValue(forKey: key)
+        pendingAvailability.removeValue(forKey: key)
         connectedPeers.remove(key)
     }
 
@@ -341,5 +384,64 @@ public actor PeerManager {
                 await fillRequests(for: key)
             }
         }
+    }
+
+    private func setPeerBitfield(_ bitfield: Bitfield, for key: String, state: PeerState) async {
+        let previous = await state.getPeerBitfield()
+        await state.setPeerBitfield(bitfield)
+        if var picker = piecePicker {
+            picker.removePeerBitfield(previous)
+            picker.addPeerBitfield(bitfield)
+            piecePicker = picker
+        }
+        peerInfos[key]?.peerBitfield = bitfield
+    }
+}
+
+private struct PeerAvailabilityHint: Sendable {
+    private var hasAllPieces = false
+    private var bitfieldData: Data?
+    private var pieces = Set<Int>()
+
+    mutating func recordBitfield(_ data: Data) {
+        hasAllPieces = false
+        bitfieldData = data
+        pieces.removeAll()
+    }
+
+    mutating func recordHave(_ piece: Int) {
+        guard !hasAllPieces else { return }
+        pieces.insert(piece)
+    }
+
+    mutating func recordHaveAll() {
+        hasAllPieces = true
+        bitfieldData = nil
+        pieces.removeAll()
+    }
+
+    mutating func recordHaveNone() {
+        hasAllPieces = false
+        bitfieldData = nil
+        pieces.removeAll()
+    }
+
+    func bitfield(pieceCount: Int) -> Bitfield {
+        var bitfield = hasAllPieces
+            ? Self.fullBitfield(pieceCount: pieceCount)
+            : Bitfield(data: bitfieldData ?? Data(), count: pieceCount)
+
+        for piece in pieces {
+            bitfield.set(piece)
+        }
+        return bitfield
+    }
+
+    private static func fullBitfield(pieceCount: Int) -> Bitfield {
+        var bitfield = Bitfield(count: pieceCount)
+        for piece in 0..<pieceCount {
+            bitfield.set(piece)
+        }
+        return bitfield
     }
 }

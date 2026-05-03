@@ -77,7 +77,24 @@ final class PeerMessageTests: XCTestCase {
         XCTAssertEqual(decoded, msg)
     }
 
-    func testUnknownMessageID() {
-        XCTAssertThrowsError(try PeerMessage.decode(from: Data([255])))
+    func testFastExtensionMessages() throws {
+        let messages: [PeerMessage] = [
+            .suggestPiece(7),
+            .haveAll,
+            .haveNone,
+            .rejectRequest(index: 1, begin: 2, length: 16_384),
+            .allowedFast(9)
+        ]
+
+        for message in messages {
+            let payload = message.encode().dropFirst(4)
+            let decoded = try PeerMessage.decode(from: Data(payload))
+            XCTAssertEqual(decoded, message)
+        }
+    }
+
+    func testUnknownMessageIDIsNonFatal() throws {
+        let decoded = try PeerMessage.decode(from: Data([255, 1, 2, 3]))
+        XCTAssertEqual(decoded, .unknown(id: 255, payload: Data([1, 2, 3])))
     }
 }

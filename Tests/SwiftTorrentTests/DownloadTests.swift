@@ -377,7 +377,12 @@ final class HandshakeExtensionBitTests: XCTestCase {
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .childChannelInitializer { channel in
                 channel.pipeline.addHandler(
-                    EagerMetadataPeerHandler(infoHash: infoHash.bytes, peerID: serverPeerID, metadata: metadata)
+                    EagerMetadataPeerHandler(
+                        infoHash: infoHash.bytes,
+                        peerID: serverPeerID,
+                        metadata: metadata,
+                        messagesBeforeExtension: [.haveAll]
+                    )
                 )
             }
             .bind(host: "127.0.0.1", port: 0)
@@ -419,6 +424,19 @@ final class HandshakeExtensionBitTests: XCTestCase {
         let received = try await waiter.value
         XCTAssertEqual(received.name, "early-metadata.txt")
         XCTAssertEqual(received.infoHash, infoHash)
+
+        let tmpDir = NSTemporaryDirectory() + "swifttorrent_availability_\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: tmpDir) }
+        await manager.configure(
+            pieceManager: PieceManager(info: received),
+            piecePicker: PiecePicker(pieceCount: received.pieceCount),
+            diskIO: DiskIO(basePath: tmpDir, fileStorage: FileStorage(info: received)),
+            pieceCount: received.pieceCount
+        )
+
+        let peerBitfield = await manager.peers().first?.peerBitfield
+        XCTAssertEqual(peerBitfield?.count, received.pieceCount)
+        XCTAssertEqual(peerBitfield?.allSet, true)
     }
 }
 
@@ -491,14 +509,21 @@ private final class EagerMetadataPeerHandler: ChannelInboundHandler, @unchecked 
     private let peerID: Data
     private let metadata: Data
     private let serverMetadataID: UInt8 = 2
+    private let messagesBeforeExtension: [PeerMessage]
     private var clientMetadataID: UInt8?
     private var pending = ByteBuffer()
     private var didSendHandshake = false
 
-    init(infoHash: Data, peerID: Data, metadata: Data) {
+    init(
+        infoHash: Data,
+        peerID: Data,
+        metadata: Data,
+        messagesBeforeExtension: [PeerMessage] = []
+    ) {
         self.infoHash = infoHash
         self.peerID = peerID
         self.metadata = metadata
+        self.messagesBeforeExtension = messagesBeforeExtension
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -517,6 +542,9 @@ private final class EagerMetadataPeerHandler: ChannelInboundHandler, @unchecked 
     private func sendHandshakeAndEarlyExtension(context: ChannelHandlerContext) {
         var response = Data()
         response.append(Handshake(infoHash: infoHash, peerID: peerID).encode())
+        for message in messagesBeforeExtension {
+            response.append(message.encode())
+        }
         response.append(PeerMessage.extended(id: 0, payload: serverExtendedHandshake()).encode())
         write(response, context: context)
     }
